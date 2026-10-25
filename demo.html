@@ -1,0 +1,30 @@
+<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Koinonia demo</title>
+<style>body{font:14px monospace;background:#0e141b;color:#cfe3ff;margin:12px}button,input{font:14px monospace;margin:3px}pre{white-space:pre-wrap}</style>
+<h3>Koinonia — demo</h3>
+<div>relay: <input id="url" size="34" placeholder="wss://seu-relay/sala1"> nome: <input id="nome" size="8"> <button id="go">Entrar</button></div>
+<div><button id="eco">Pedir "eco" a alguém</button> <button id="x">Limpar</button></div>
+<pre id="out"></pre>
+<script type="module">
+import { Node, wsTransport } from './koinonia.js';
+import { rtcMesh } from './koinonia-rtc.js';
+const $ = id => document.getElementById(id), out = $('out');
+const u = new URLSearchParams(location.search); $('url').value = u.get('relay') || localStorage.kr || ''; $('nome').value = u.get('nome') || 'cel' + (Math.random() * 99 | 0);
+let node, mesh; const log = t => { out.textContent = t + '\n' + out.textContent.slice(0, 3000); };
+$('go').onclick = async () => {
+  localStorage.kr = $('url').value;
+  node = await Node.create({ name: $('nome').value });
+  node.serve('eco', x => x);
+  node.onevent = (t, x) => log(`[${t}] ${x}`);
+  const l = wsTransport($('url').value); await l.ready; node.attach(l);
+  mesh = rtcMesh(node, { iceServers: [{ urls: 'stun:stun.l.google.com:19302' } /* + TURN seu, ver DEPLOY.md */] });
+  log('conectado como ' + node.name + ' (' + node.id.slice(0, 8) + ')');
+  setInterval(() => { out.dataset.s = [...node.peers.values()].map(p => `${p.name}:${p.rtc?.open ? 'DIRETO' : 'relay'}`).join(' | '); document.title = out.dataset.s || 'Koinonia'; }, 1000);
+};
+$('eco').onclick = async () => {
+  const s = 'oi-' + (Math.random() * 1e4 | 0);
+  const r = await node.request('eco', s, { check: x => x === s });
+  log(`eco → ${node.peers.get(r.peer)?.name || '?'} ${r.ok ? 'OK' : 'FALHOU ' + (r.erro || '')} via ${node.peers.get(r.peer)?.rtc?.open ? 'WebRTC direto' : 'relay'}\n` + (r.peer ? node.explain(r.peer, 'eco') : ''));
+};
+$('x').onclick = () => { out.textContent = ''; };
+</script>
