@@ -16,8 +16,15 @@ export class Sala {
     webSocketClose(ws, code) { try { ws.close(code === 1005 ? 1000 : code); } catch (_) {} }
 }
 export default {
-    fetch(req, env) {
-        const sala = new URL(req.url).pathname.slice(0, 64) || '/';
+    async fetch(req, env) {
+        const url = new URL(req.url);
+        if (url.pathname === '/saude') {          // para o vigia externo: responde 200 só se a Durable Object (o miolo do relay) também responde
+            try {
+                const r = await env.SALA.get(env.SALA.idFromName('__saude')).fetch(new Request(req.url));
+                return new Response(r.status === 426 ? 'ok' : 'degradado ' + r.status, { status: r.status === 426 ? 200 : 503, headers: { 'cache-control': 'no-store' } });
+            } catch (e) { return new Response('erro ' + String(e.message || e).slice(0, 80), { status: 503, headers: { 'cache-control': 'no-store' } }); }
+        }
+        const sala = url.pathname.slice(0, 64) || '/';
         return env.SALA.get(env.SALA.idFromName(sala)).fetch(req);
     }
 };
