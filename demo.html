@@ -13,7 +13,8 @@ import { rtcMesh } from './koinonia-rtc.js';
 import { PLEIADES, horaDeRelay } from './pleiades.js';
 const $ = id => document.getElementById(id), out = $('out');
 const L = { get: k => { try { return localStorage.getItem(k); } catch (_) { return null; } }, set: (k, v) => { try { localStorage.setItem(k, v); } catch (_) {} } };
-const u = new URLSearchParams(location.search); $('url').value = u.get('relay') || L.get('kr') || ''; $('nome').value = u.get('nome') || L.get('kn') || 'cel' + (Math.random() * 99 | 0);
+const u = new URLSearchParams(location.search); if (u.has('mentir')) L.set('pleiadesMentir', u.get('mentir') === '1' ? '1' : '0');   // teste: ?mentir=1 faz ESTE aparelho mentir nos sensores; ?mentir=0 desfaz
+$('url').value = u.get('relay') || L.get('kr') || ''; $('nome').value = u.get('nome') || L.get('kn') || 'cel' + (Math.random() * 99 | 0);
 let node, mesh, pl, relayOn = false; const log = t => { out.textContent = t + '\n' + out.textContent.slice(0, 3000); };
 const conhecidos = new Map(JSON.parse(L.get('k.conhecidos') || '[]'));
 const atualizaLista = () => { const v = $('para').value; $('para').textContent = ''; for (const [id, n] of conhecidos) { const o = document.createElement('option'); o.value = id; o.textContent = n + ' (' + id.slice(0, 5) + ')'; $('para').appendChild(o); } if (v) $('para').value = v; };
@@ -21,7 +22,8 @@ atualizaLista();
 $('go').onclick = async () => {
   L.set('kr', $('url').value); L.set('kn', $('nome').value);
   let ident = null; try { const s = L.get('k.id'); if (s) ident = await createIdentity(JSON.parse(s)); } catch (_) {}
-  if (!ident) { ident = await createIdentity(); L.set('k.id', JSON.stringify(await ident.exportar())); }      // identidade FIXA: é o "endereço" dos recados
+  if (!ident) ident = await createIdentity();                                                                // identidade FIXA: é o "endereço" dos recados
+  if (ident.novaCifra) L.set('k.id', JSON.stringify(await ident.exportar()));                                // v0.2: guarda também a chave de CIFRA
   node = await Node.create({ identity: ident, name: $('nome').value, halfLifeMs: 3 * 864e5 });
   try { node.importLedger(JSON.parse(L.get('k.ledger') || 'null')); node.importNotas(JSON.parse(L.get('k.notas') || '[]')); } catch (_) {}
   node.serve('eco', x => x);
@@ -49,9 +51,9 @@ $('pulso').onclick = async () => {
   log(r.ok ? 'pulso: ' + JSON.stringify(r.result) : 'pulso falhou: ' + (r.erro || ''));
 };
 $('rec').onclick = async () => {
-  try { await node.note($('para').value, 'texto', $('txt').value, { ttlMs: 72 * 3600e3 }); log('recado deixado (vale 72 h)'); $('txt').value = ''; }
-  catch (e) { log('recado falhou: ' + e.message); }
+  try { await node.note($('para').value, 'texto', $('txt').value, { ttlMs: 72 * 3600e3 }); log('recado deixado — cifrado e selado (vale 72 h)'); $('txt').value = ''; }
+  catch (e) { log(e.message === 'sem-chave-do-destino' ? 'recado não saiu: ainda não tenho a chave de cifra dele (ele precisa entrar na sala 1× com a versão nova)' : 'recado falhou: ' + e.message); }
 };
-$('rede').onclick = () => log(pl ? pl.resumo() : 'entre primeiro');
+$('rede').onclick = () => log(pl ? pl.resumo() + '\nrelay: ' + (node.stat.relayProvado === true ? 'aceitou minha prova de identidade' : node.stat.relayProvado === false ? 'NÃO aceitou a prova' : 'não pediu prova (worker antigo?)') : 'entre primeiro');
 $('x').onclick = () => { out.textContent = ''; };
 </script>

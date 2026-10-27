@@ -1,5 +1,5 @@
 // ============================================================================
-// KOINONIA — um socket de sociedade (v0.1)
+// KOINONIA — um socket de sociedade (v0.2 · 2026-10-27)
 // WebSocket é a linha telefônica. Koinonia é a linha + lista telefônica + currículo + histórico de quem atende:
 //   identidade assinada · capacidades declaradas · reputação POR capacidade (com validade) · descoberta sem varrer a rede
 //   · calibração de novatos · restrição com caminho de volta · mérito + rodízio.
@@ -7,12 +7,25 @@
 // Roda em navegador moderno e Node ≥ 18 (WebCrypto + TextEncoder + btoa).
 //
 // O que ele GARANTE: continuidade de identidade (id = hash da chave pública; mensagens assinadas, janela anti-replay).
-// O que NÃO garante: honestidade (por isso a reputação), sigilo (use wss:// / DTLS; payload é visível ao relay), anti-Sybil forte
+// O que NÃO garante: honestidade (por isso a reputação), sigilo das mensagens AO VIVO (use wss:// / DTLS; payload ao vivo é visível
+//   ao relay — só os RECADOS são cifrados ponta a ponta, desde a v0.2), anti-Sybil forte
 //   (id novo é grátis; o freio é: começa no nível 0, a cadeira do novato é limitada pelo rodízio, e nada crítico vai a quem não provou).
 //
 // Big-O (P = pares conhecidos, limitado a MAX_PEERS; K = 8; C = candidatos por capacidade ≤ 64):
 //   enviar/receber: O(tamanho) + 1 assinatura/verificação · find/escolha: O(C) · consulta de descoberta: O(K log K), independe de P
 //   memória: pares ≤ 256 · células de reputação ≤ 4096 (LRU) · nonces ≤ 2048 · pendentes ≤ maxPending.
+//
+// v0.2 (2026-10-27) — RECADOS CIFRADOS E SELADOS + PROVA DE IDENTIDADE NO RELAY
+//   Analogia: carta em envelope lacrado, SEM remetente no envelope. O carteiro (relay) só lê o destinatário e a validade;
+//   o nome de quem mandou e a assinatura dele vão DENTRO da carta. E a caixa postal agora tem chave: para retirar as
+//   cartas de X é preciso assinar na hora um desafio que só a chave privada de X assina.
+//   • cada identidade ganha uma 2ª chave (ECDH P-256, só para cifra), publicada no ANN assinado → vinculada ao id;
+//   • recado = ECIES: chave efêmera por recado → ECDH → HKDF-SHA256 → AES-GCM-256 (dados extras: destino|validade);
+//     dentro do selo vai o envelope NOTE completo, assinado como antes;
+//   • sem a chave de cifra do destino (nunca se apresentou) o recado NÃO sai (nunca em claro); NOTE em claro é recusado;
+//   • relay manda DESAFIO; o nó responde PROVA assinada (só em enlace marcado relay=true: nunca a pedido de um par).
+//   Custo: 1 ECDH + 1 HKDF + 1 AES-GCM por recado (≈ 1 ms). O relay continua vendo: destino, tamanho, hora, e QUAL
+//   conexão (já provada) entregou o selo — o "de quem" só se esconde do que fica guardado e de quem escuta a sala.
 // ============================================================================
 
 const enc = new TextEncoder();
@@ -25,25 +38,44 @@ const canon = o => (o === null || typeof o !== 'object') ? JSON.stringify(o)
 const subtle = () => globalThis.crypto.subtle;
 const ECDSA = { name: 'ECDSA', namedCurve: 'P-256' };
 const SIG = { name: 'ECDSA', hash: 'SHA-256' };
+const ECDH = { name: 'ECDH', namedCurve: 'P-256' };
 
 // ------------------------------------------------------------------ identidade
+// v0.2: + chave de CIFRA (ECDH). Identidade salva sem ela ganha uma nova (novaCifra = true): salve exportar() de novo.
 export async function createIdentity(saved) {
-    let priv, pub;
+    let priv, pub, epriv = null, epub = null, novaCifra = false;
     if (saved) {
         priv = await subtle().importKey('jwk', saved.priv, ECDSA, true, ['sign']);
         pub = await subtle().importKey('jwk', saved.pub, ECDSA, true, ['verify']);
+        if (saved.epriv && saved.epub) {
+            try { epriv = await subtle().importKey('jwk', saved.epriv, ECDH, true, ['deriveBits']); epub = await subtle().importKey('jwk', saved.epub, ECDH, true, []); }
+            catch (_) { epriv = null; epub = null; }
+        }
     } else {
         const kp = await subtle().generateKey(ECDSA, true, ['sign', 'verify']);
         priv = kp.privateKey; pub = kp.publicKey;
     }
+    if (!epriv) { const ek = await subtle().generateKey(ECDH, true, ['deriveBits']); epriv = ek.privateKey; epub = ek.publicKey; novaCifra = true; }
     const raw = new Uint8Array(await subtle().exportKey('raw', pub));
+    const eraw = new Uint8Array(await subtle().exportKey('raw', epub));
     return {
-        id: await idOf(raw), priv, pubB64: b64(raw),
-        // guarde isto (localStorage/IndexedDB) para manter a MESMA identidade entre sessões
-        exportar: async () => ({ priv: await subtle().exportKey('jwk', priv), pub: await subtle().exportKey('jwk', pub) })
+        id: await idOf(raw), priv, pubB64: b64(raw), epriv, ekB64: b64(eraw), novaCifra,
+        // guarde isto (localStorage/IndexedDB) para manter a MESMA identidade (e a mesma chave de cifra) entre sessões
+        exportar: async () => ({
+            priv: await subtle().exportKey('jwk', priv), pub: await subtle().exportKey('jwk', pub),
+            epriv: await subtle().exportKey('jwk', epriv), epub: await subtle().exportKey('jwk', epub)
+        })
     };
 }
 async function idOf(raw) { return b64(new Uint8Array(await subtle().digest('SHA-256', raw))).slice(0, 22); }
+
+// Selo (ECIES): ECDH(priv, pub) → HKDF-SHA256(sal = chave efêmera, info = destino) → chave AES-GCM-256.
+async function chaveSelo(privEcdh, pubRaw, sal, para) {
+    const pub = await subtle().importKey('raw', pubRaw, ECDH, false, []);
+    const bits = await subtle().deriveBits({ name: 'ECDH', public: pub }, privEcdh, 256);
+    const hk = await subtle().importKey('raw', bits, 'HKDF', false, ['deriveKey']);
+    return subtle().deriveKey({ name: 'HKDF', hash: 'SHA-256', salt: sal, info: enc.encode('koinonia/selo/v1|' + para) }, hk, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+}
 
 // ------------------------------------------------------------------ reputação (por par × capacidade)
 const N1 = 4, N2 = 12, N3 = 30;
@@ -155,7 +187,8 @@ export class Node {
         this.inflight = 0;
         this.epoch = { id: 0, refs: 0 };
         this.events = [];
-        this.stat = { tx: 0, rx: 0, rejeitadas: 0, motivos: {}, req: 0, ok: 0, falhas: 0, timeouts: 0, notas: 0, notasEnviadas: 0, porNivel: [0, 0, 0, 0] };
+        this.stat = { tx: 0, rx: 0, rejeitadas: 0, motivos: {}, req: 0, ok: 0, falhas: 0, timeouts: 0, notas: 0, notasEnviadas: 0, porNivel: [0, 0, 0, 0], relayProvado: null };
+        this.chaves = new Map();        // id -> chave de CIFRA (b64) vista num ANN assinado; guardada com exportLedger (recado a quem está desligado)
         this._timers = [];
         this.onevent = null;
         this.notasVistas = new Map();   // id da nota -> validade (anti-repetição; guarde com exportNotas/importNotas)
@@ -271,18 +304,34 @@ export class Node {
         const r = this.ledger.read(id, cap), p = this.peers.get(id);
         return `${p?.name || '?'} (${id.slice(0, 8)}) em "${cap}": evidência ${r.n.toFixed(1)}, taxa ${r.mean.toFixed(2)} (limite inferior ${r.lb.toFixed(2)}) vs acaso ${r.chance.toFixed(2)} → vantagem ${r.skill.toFixed(2)}, nível ${r.tier}${r.restr ? ', EM RESTRIÇÃO' : ''}; credibilidade como indicador ${this.ledger.credOf(id).toFixed(2)}`;
     }
-    // RECADO (caixa postal): fica no relay até a validade e chega mesmo que o destino esteja desligado agora. NÃO é cifrado: o relay lê.
+    // RECADO (caixa postal): fica no relay até a validade e chega mesmo que o destino esteja desligado agora.
+    // v0.2: sempre CIFRADO e SELADO para a chave de cifra do destino; sem ela, não sai (erro 'sem-chave-do-destino').
     async note(to, cap, data, { ttlMs = 24 * 3600e3 } = {}) {
         if (typeof to !== 'string' || !to || typeof cap !== 'string' || !cap || cap.length > 48) throw new Error('nota-invalida');
         if (JSON.stringify(data ?? null).length > this.cfg.noteMaxBytes) throw new Error('nota-grande');
         if (this.links.size === 0) throw new Error('sem-enlace');
-        await this._send(to, 'NOTE', { cap, data: data ?? null, exp: this.now() + Math.min(Math.max(ttlMs, 1000), this.cfg.noteMaxMs) });
+        const ek = this.peers.get(to)?.ek || this.chaves.get(to);
+        if (!ek) throw new Error('sem-chave-do-destino');
+        const exp = this.now() + Math.min(Math.max(ttlMs, 1000), this.cfg.noteMaxMs);
+        const dentro = JSON.stringify(await this._env('NOTE', to, { cap, data: data ?? null, exp }));   // envelope assinado, como na v0.1
+        const eph = await subtle().generateKey(ECDH, true, ['deriveBits']);                            // chave efêmera: uma por recado
+        const epk = new Uint8Array(await subtle().exportKey('raw', eph.publicKey));
+        const key = await chaveSelo(eph.privateKey, unb64(ek), epk, to);
+        const iv = crypto.getRandomValues(new Uint8Array(12));
+        const ct = new Uint8Array(await subtle().encrypt({ name: 'AES-GCM', iv, additionalData: enc.encode(to + '|' + exp) }, key, enc.encode(dentro)));
+        this._raw({ v: 1, t: 'SEAL', to, exp, epk: b64(epk), iv: b64(iv), ct: b64(ct) }, this.peers.get(to)?.link || null);   // por fora: só destino e validade
         this.stat.notasEnviadas++;
     }
+    podeRecado(id) { return !!(this.peers.get(id)?.ek || this.chaves.get(id)); }
     exportNotas() { const t = this.now(); return [...this.notasVistas].filter(([, e]) => e >= t); }
     importNotas(a) { if (!Array.isArray(a)) return; for (const x of a) if (Array.isArray(x) && typeof x[0] === 'string' && typeof x[1] === 'number') this.notasVistas.set(x[0], x[1]); }
-    exportLedger() { return this.ledger.toJSON(); }
-    importLedger(j) { return this.ledger.fromJSON(j); }
+    exportLedger() { return { ...this.ledger.toJSON(), chaves: [...this.chaves].slice(-256) }; }
+    importLedger(j) {
+        const ok = this.ledger.fromJSON(j);
+        if (j && Array.isArray(j.chaves)) for (const x of j.chaves) if (Array.isArray(x) && typeof x[0] === 'string' && typeof x[1] === 'string' && x[1].length <= 120) this._guardaChave(x[0], x[1]);
+        return ok;
+    }
+    _guardaChave(id, ek) { this.chaves.delete(id); this.chaves.set(id, ek); if (this.chaves.size > 256) this.chaves.delete(this.chaves.keys().next().value); }
     stats() { return { id: this.id, peers: this.peers.size, ...this.stat, eventos: this.events.slice(-10) }; }
 
     // ------------------------------------------------------------ protocolo
@@ -326,7 +375,32 @@ export class Node {
     }
     async _announce() {
         if (!this.links.size) return;
-        this._raw(await this._env('ANN', null, { name: this.name, caps: [...this.caps.keys()].slice(0, 16) }, 0));
+        this._raw(await this._env('ANN', null, { name: this.name, caps: [...this.caps.keys()].slice(0, 16), ek: this.ident.ekB64 }, 0));
+    }
+
+    // ---- relay: desafio-resposta (prova de que este socket é dono do id) · só em enlace marcado relay=true
+    async _onDesafio(link, env) {
+        if (!link || link.relay !== true || typeof env.c !== 'string' || env.c.length > 64) return;
+        this.stat.relayProvado = false;
+        this._raw(await this._env('PROVA', null, { c: env.c, aud: 'koinonia-relay' }), link);
+    }
+    // ---- recado selado: abre, confere que o envelope de dentro é um NOTE para mim com a mesma validade, e processa como NOTE
+    async _onSeal(link, env) {
+        if (env.to !== this.id) return;
+        if (typeof env.exp !== 'number' || !isFinite(env.exp) || ![env.epk, env.iv, env.ct].every(s => typeof s === 'string') || env.ct.length > 24000) return this._reject('selo-invalido');
+        if (env.exp < this.now()) return this._reject('nota-expirada');
+        const sk = 's:' + env.iv.slice(0, 24);
+        if (this.notasVistas.has(sk)) return;                                       // o relay reentrega os guardados a cada conexão: silêncio
+        let dentro;
+        try {
+            const epk = unb64(env.epk);
+            const key = await chaveSelo(this.ident.epriv, epk, epk, this.id);
+            dentro = new TextDecoder().decode(await subtle().decrypt({ name: 'AES-GCM', iv: unb64(env.iv), additionalData: enc.encode(env.to + '|' + env.exp) }, key, unb64(env.ct)));
+        } catch (_) { return this._reject('selo-nao-abre'); }
+        let ie; try { ie = JSON.parse(dentro); } catch (_) { return this._reject('selo-invalido'); }
+        if (!ie || ie.t !== 'NOTE' || ie.to !== this.id || !ie.body || ie.body.exp !== env.exp) return this._reject('selo-invalido');
+        this.notasVistas.set(sk, env.exp); if (this.notasVistas.size > 2000) this.notasVistas.delete(this.notasVistas.keys().next().value);
+        return this._onRaw(link, dentro, true);
     }
 
     _reject(motivo) { this.stat.rejeitadas++; this.stat.motivos[motivo] = (this.stat.motivos[motivo] || 0) + 1; }
@@ -337,13 +411,20 @@ export class Node {
         if (b.n < 1) return false; b.n--; return true;
     }
 
-    async _onRaw(link, raw) {
+    async _onRaw(link, raw, selado = false) {
         let env; try { env = JSON.parse(raw); } catch (_) { return this._reject('json'); }
+        if (env && !selado) {                                                       // mensagens SEM assinatura de par: do relay, ou o selo
+            if (env.t === 'DESAFIO') return this._onDesafio(link, env);
+            if (env.t === 'ACEITO') { if (link?.relay === true) { this.stat.relayProvado = true; this._ev('relay', 'identidade aceita pelo relay'); return this._announce(); } return; }
+            if (env.t === 'RECUSADO') { if (link?.relay === true) { this.stat.relayProvado = false; this._ev('relay', 'o relay recusou a prova: ' + String(env.motivo || '?').slice(0, 40)); } return; }
+            if (env.t === 'SEAL') return this._onSeal(link, env);
+        }
         if (!env || env.v !== 1 || typeof env.from !== 'string' || typeof env.sig !== 'string' || typeof env.pub !== 'string' || typeof env.n !== 'string') return this._reject('formato');
         if (env.from === this.id) return;
         if (env.to && env.to !== this.id) return;                                   // não é para mim (relay em broadcast)
         const t = this.now();
         if (env.t === 'NOTE') {                                                      // RECADO: assinado, endereçado, com VALIDADE (pode chegar horas/dias depois, via relay)
+            if (!selado) return this._reject('nota-sem-cifra');                      // v0.2: recado em claro não é aceito
             const e0 = env.body && env.body.exp;
             if (!env.to) return this._reject('nota-sem-destino');
             if (typeof e0 !== 'number' || !isFinite(e0) || typeof env.ts !== 'number') return this._reject('nota-invalida');
@@ -393,6 +474,7 @@ export class Node {
         const eraNovo = !p.caps.size && !p.annSeen;
         for (const c of p.caps) this.index.get(c)?.delete(env.from);
         p.name = String(b.name || '?').slice(0, 32); p.caps = new Set((Array.isArray(b.caps) ? b.caps : []).filter(x => typeof x === 'string').slice(0, 16)); p.annSeen = true;
+        if (typeof b.ek === 'string' && b.ek.length <= 120) { p.ek = b.ek; this._guardaChave(env.from, b.ek); }   // chave de cifra vinculada ao id pela assinatura do ANN
         for (const c of p.caps) this._indexAdd(c, env.from);
         if (eraNovo) { this._announce(); this.onPeerNew?.(env.from); }               // apresentação mútua (+ gancho p/ abrir WebRTC)
         if ((env.h || 0) < 2 && this.links.size > 1) {                              // gossip limitado (2 saltos, nunca de volta)
@@ -435,7 +517,7 @@ export class MemoryHub {
     }
 }
 export function wsTransport(url, WS = globalThis.WebSocket) {
-    const ws = new WS(url), l = { onmessage: null, onclose: null, send: s => ws.send(s), close: () => ws.close() };
+    const ws = new WS(url), l = { relay: true, onmessage: null, onclose: null, send: s => ws.send(s), close: () => ws.close() };   // relay: true → responde ao DESAFIO
     l.ready = new Promise((ok, no) => { ws.onopen = () => ok(l); ws.onerror = no; });
     ws.onmessage = e => l.onmessage?.(typeof e.data === 'string' ? e.data : String(e.data)); ws.onclose = () => l.onclose?.();
     return l;
