@@ -1,30 +1,57 @@
 <!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Koinonia demo</title>
-<style>body{font:14px monospace;background:#0e141b;color:#cfe3ff;margin:12px}button,input{font:14px monospace;margin:3px}pre{white-space:pre-wrap}</style>
+<style>body{font:14px monospace;background:#0e141b;color:#cfe3ff;margin:12px}button,input,select{font:14px monospace;margin:3px}pre{white-space:pre-wrap}.n{color:#9fd6a8}</style>
 <h3>Koinonia — demo</h3>
 <div>relay: <input id="url" size="34" placeholder="wss://seu-relay/sala1"> nome: <input id="nome" size="8"> <button id="go">Entrar</button></div>
-<div><button id="eco">Pedir "eco" a alguém</button> <button id="x">Limpar</button></div>
+<div><button id="eco">Pedir "eco" a alguém</button> <button id="pulso">Pedir "pulso" do Pytronicos</button> <button id="rede">Ver rede de sensores</button> <button id="x">Limpar</button></div>
+<div>recado para: <select id="para"></select> <input id="txt" size="22" placeholder="texto do recado"> <button id="rec">Deixar recado</button></div>
+<div id="eu"></div>
 <pre id="out"></pre>
 <script type="module">
-import { Node, wsTransport } from './koinonia.js';
+import { Node, createIdentity, wsTransport } from './koinonia.js';
 import { rtcMesh } from './koinonia-rtc.js';
+import { PLEIADES, horaDeRelay } from './pleiades.js';
 const $ = id => document.getElementById(id), out = $('out');
-const u = new URLSearchParams(location.search); $('url').value = u.get('relay') || localStorage.kr || ''; $('nome').value = u.get('nome') || 'cel' + (Math.random() * 99 | 0);
-let node, mesh; const log = t => { out.textContent = t + '\n' + out.textContent.slice(0, 3000); };
+const L = { get: k => { try { return localStorage.getItem(k); } catch (_) { return null; } }, set: (k, v) => { try { localStorage.setItem(k, v); } catch (_) {} } };
+const u = new URLSearchParams(location.search); $('url').value = u.get('relay') || L.get('kr') || ''; $('nome').value = u.get('nome') || L.get('kn') || 'cel' + (Math.random() * 99 | 0);
+let node, mesh, pl, relayOn = false; const log = t => { out.textContent = t + '\n' + out.textContent.slice(0, 3000); };
+const conhecidos = new Map(JSON.parse(L.get('k.conhecidos') || '[]'));
+const atualizaLista = () => { const v = $('para').value; $('para').textContent = ''; for (const [id, n] of conhecidos) { const o = document.createElement('option'); o.value = id; o.textContent = n + ' (' + id.slice(0, 5) + ')'; $('para').appendChild(o); } if (v) $('para').value = v; };
+atualizaLista();
 $('go').onclick = async () => {
-  localStorage.kr = $('url').value;
-  node = await Node.create({ name: $('nome').value });
+  L.set('kr', $('url').value); L.set('kn', $('nome').value);
+  let ident = null; try { const s = L.get('k.id'); if (s) ident = await createIdentity(JSON.parse(s)); } catch (_) {}
+  if (!ident) { ident = await createIdentity(); L.set('k.id', JSON.stringify(await ident.exportar())); }      // identidade FIXA: é o "endereço" dos recados
+  node = await Node.create({ identity: ident, name: $('nome').value, halfLifeMs: 3 * 864e5 });
+  try { node.importLedger(JSON.parse(L.get('k.ledger') || 'null')); node.importNotas(JSON.parse(L.get('k.notas') || '[]')); } catch (_) {}
   node.serve('eco', x => x);
   node.onevent = (t, x) => log(`[${t}] ${x}`);
-  const l = wsTransport($('url').value); await l.ready; node.attach(l);
+  node.onnote = n => { log(`📬 RECADO de ${n.name || n.from.slice(0, 5)} [${n.cap}]: ${typeof n.data === 'string' ? n.data : JSON.stringify(n.data)}`); salva(); };
+  const l = wsTransport($('url').value); await l.ready; node.attach(l); relayOn = true; { const oc = l.onclose; l.onclose = () => { relayOn = false; oc?.(); }; }
   mesh = rtcMesh(node, { iceServers: [{ urls: 'stun:stun.l.google.com:19302' } /* + TURN seu, ver DEPLOY.md */] });
+  try { pl = new PLEIADES(node, { horaUrl: horaDeRelay($('url').value), relayAberto: () => relayOn, log }); } catch (e) { log('sensores não iniciaram: ' + e.message); }
+  $('eu').innerHTML = 'seu id (passe a quem quiser lhe deixar recado): <b class="n">' + node.id + '</b>';
   log('conectado como ' + node.name + ' (' + node.id.slice(0, 8) + ')');
-  setInterval(() => { out.dataset.s = [...node.peers.values()].map(p => `${p.name}:${p.rtc?.open ? 'DIRETO' : 'relay'}`).join(' | '); document.title = out.dataset.s || 'Koinonia'; }, 1000);
+  const salva = () => { L.set('k.ledger', JSON.stringify(node.exportLedger())); L.set('k.notas', JSON.stringify(node.exportNotas())); L.set('k.conhecidos', JSON.stringify([...conhecidos].slice(-100))); };
+  setInterval(() => {
+    for (const [id, p] of node.peers) if (p.name && conhecidos.get(id) !== p.name) { conhecidos.delete(id); conhecidos.set(id, p.name); atualizaLista(); }
+    out.dataset.s = [...node.peers.values()].map(p => `${p.name}:${p.rtc?.open ? 'DIRETO' : 'relay'}`).join(' | '); document.title = out.dataset.s || 'Koinonia'; salva();
+  }, 2000);
+  addEventListener('pagehide', salva);
 };
 $('eco').onclick = async () => {
   const s = 'oi-' + (Math.random() * 1e4 | 0);
   const r = await node.request('eco', s, { check: x => x === s });
   log(`eco → ${node.peers.get(r.peer)?.name || '?'} ${r.ok ? 'OK' : 'FALHOU ' + (r.erro || '')} via ${node.peers.get(r.peer)?.rtc?.open ? 'WebRTC direto' : 'relay'}\n` + (r.peer ? node.explain(r.peer, 'eco') : ''));
 };
+$('pulso').onclick = async () => {
+  const r = await node.request('pytronicos.pulso', null);
+  log(r.ok ? 'pulso: ' + JSON.stringify(r.result) : 'pulso falhou: ' + (r.erro || ''));
+};
+$('rec').onclick = async () => {
+  try { await node.note($('para').value, 'texto', $('txt').value, { ttlMs: 72 * 3600e3 }); log('recado deixado (vale 72 h)'); $('txt').value = ''; }
+  catch (e) { log('recado falhou: ' + e.message); }
+};
+$('rede').onclick = () => log(pl ? pl.resumo() : 'entre primeiro');
 $('x').onclick = () => { out.textContent = ''; };
 </script>
