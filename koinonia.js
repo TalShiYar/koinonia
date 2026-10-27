@@ -95,6 +95,17 @@ class Ledger {
         return null;
     }
     credOf(id) { const c = this.cred.get(id); return c ? c.a / (c.a + c.b) : 0.5; }
+    // memória entre sessões: o chamador guarda o JSON (localStorage etc.) e devolve em fromJSON; entradas inválidas são ignoradas
+    toJSON() { return { v: 1, cells: [...this.cells], chance: [...this.chance], cred: [...this.cred] }; }
+    fromJSON(j) {
+        if (!j || j.v !== 1) return false;
+        const ok = (m, f) => new Map((Array.isArray(m) ? m : []).filter(e => Array.isArray(e) && typeof e[0] === 'string' && e[1] && f(e[1])));
+        const num = (...v) => v.every(x => typeof x === 'number' && isFinite(x));
+        this.cells = ok(j.cells, c => num(c.ea, c.eb, c.t) && typeof c.restr === 'boolean');
+        this.chance = ok(j.chance, c => num(c.ea, c.eb, c.t));
+        this.cred = ok(j.cred, c => num(c.a, c.b));
+        return true;
+    }
     // quem indicou este par assume o resultado
     ref(peer, cap, refId) {
         const key = peer + '|' + cap; let r = this.refs.get(key);
@@ -121,7 +132,7 @@ class Ledger {
 const DEF = {
     halfLifeMs: 10 * 60 * 1000, maxPeers: 256, maxCells: 4096, maxCapPeers: 64, maxPending: 256, maxInflight: 32,
     skewMs: 60000, nonceCap: 2048, rateBurst: 60, ratePerSec: 30, refValidMs: 5 * 60 * 1000, epochMs: 60000,
-    timeoutMs: 3000, calibMs: 5000, now: () => Date.now()
+    timeoutMs: 3000, calibMs: 5000, noteMaxMs: 7 * 864e5, noteMaxBytes: 8000, now: () => Date.now()
 };
 
 export class Node {
@@ -144,9 +155,11 @@ export class Node {
         this.inflight = 0;
         this.epoch = { id: 0, refs: 0 };
         this.events = [];
-        this.stat = { tx: 0, rx: 0, rejeitadas: 0, motivos: {}, req: 0, ok: 0, falhas: 0, timeouts: 0, porNivel: [0, 0, 0, 0] };
+        this.stat = { tx: 0, rx: 0, rejeitadas: 0, motivos: {}, req: 0, ok: 0, falhas: 0, timeouts: 0, notas: 0, notasEnviadas: 0, porNivel: [0, 0, 0, 0] };
         this._timers = [];
         this.onevent = null;
+        this.notasVistas = new Map();   // id da nota -> validade (anti-repetição; guarde com exportNotas/importNotas)
+        this.onnote = null;             // ({id, from, name, cap, data, ts, exp, nivel}) => void
     }
     _start() {
         const t = setInterval(() => this._autopilot(), this.cfg.calibMs);
@@ -258,6 +271,18 @@ export class Node {
         const r = this.ledger.read(id, cap), p = this.peers.get(id);
         return `${p?.name || '?'} (${id.slice(0, 8)}) em "${cap}": evidência ${r.n.toFixed(1)}, taxa ${r.mean.toFixed(2)} (limite inferior ${r.lb.toFixed(2)}) vs acaso ${r.chance.toFixed(2)} → vantagem ${r.skill.toFixed(2)}, nível ${r.tier}${r.restr ? ', EM RESTRIÇÃO' : ''}; credibilidade como indicador ${this.ledger.credOf(id).toFixed(2)}`;
     }
+    // RECADO (caixa postal): fica no relay até a validade e chega mesmo que o destino esteja desligado agora. NÃO é cifrado: o relay lê.
+    async note(to, cap, data, { ttlMs = 24 * 3600e3 } = {}) {
+        if (typeof to !== 'string' || !to || typeof cap !== 'string' || !cap || cap.length > 48) throw new Error('nota-invalida');
+        if (JSON.stringify(data ?? null).length > this.cfg.noteMaxBytes) throw new Error('nota-grande');
+        if (this.links.size === 0) throw new Error('sem-enlace');
+        await this._send(to, 'NOTE', { cap, data: data ?? null, exp: this.now() + Math.min(Math.max(ttlMs, 1000), this.cfg.noteMaxMs) });
+        this.stat.notasEnviadas++;
+    }
+    exportNotas() { const t = this.now(); return [...this.notasVistas].filter(([, e]) => e >= t); }
+    importNotas(a) { if (!Array.isArray(a)) return; for (const x of a) if (Array.isArray(x) && typeof x[0] === 'string' && typeof x[1] === 'number') this.notasVistas.set(x[0], x[1]); }
+    exportLedger() { return this.ledger.toJSON(); }
+    importLedger(j) { return this.ledger.fromJSON(j); }
     stats() { return { id: this.id, peers: this.peers.size, ...this.stat, eventos: this.events.slice(-10) }; }
 
     // ------------------------------------------------------------ protocolo
@@ -318,7 +343,14 @@ export class Node {
         if (env.from === this.id) return;
         if (env.to && env.to !== this.id) return;                                   // não é para mim (relay em broadcast)
         const t = this.now();
-        if (Math.abs(t - env.ts) > this.cfg.skewMs) return this._reject('relogio');
+        if (env.t === 'NOTE') {                                                      // RECADO: assinado, endereçado, com VALIDADE (pode chegar horas/dias depois, via relay)
+            const e0 = env.body && env.body.exp;
+            if (!env.to) return this._reject('nota-sem-destino');
+            if (typeof e0 !== 'number' || !isFinite(e0) || typeof env.ts !== 'number') return this._reject('nota-invalida');
+            if (e0 < t) return this._reject('nota-expirada');
+            if (e0 - env.ts > this.cfg.noteMaxMs || env.ts > t + this.cfg.skewMs) return this._reject('nota-invalida');
+            if (this.notasVistas.has(env.n)) return this._reject('replay');
+        } else if (Math.abs(t - env.ts) > this.cfg.skewMs) return this._reject('relogio');
         if (this.nonces.has(env.n)) return this._reject('replay');
         if (!this._bucket(env.from)) return this._reject('taxa');
         // identidade: o id TEM de ser o hash da chave pública, e a assinatura TEM de fechar
@@ -339,6 +371,13 @@ export class Node {
         const b = env.body || {};
         switch (env.t) {
             case 'ANN': return this._onAnn(env, p, b);
+            case 'NOTE': {
+                if (typeof b.cap !== 'string' || b.cap.length > 48 || JSON.stringify(b.data ?? null).length > this.cfg.noteMaxBytes) return this._reject('nota-grande');
+                this.notasVistas.set(env.n, b.exp); if (this.notasVistas.size > 2000) this.notasVistas.delete(this.notasVistas.keys().next().value);
+                this.stat.notas++;
+                try { this.onnote?.({ id: env.n, from: env.from, name: p.name, cap: b.cap, data: b.data ?? null, ts: env.ts, exp: b.exp, nivel: this.ledger.read(env.from, 'nota').tier }); } catch (_) {}
+                return;
+            }
             case 'RTC': return this.onRtc?.(env.from, b);              // sinalização WebRTC (assinada, endereçada)
             case 'REQ': return this._onReq(env, p, b);
             case 'WHO': return this._onWho(env, p, b);
