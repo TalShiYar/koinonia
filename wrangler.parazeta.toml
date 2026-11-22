@@ -1,0 +1,6 @@
+name = "parazeta-gateway"
+main = "parazeta_gateway.js"
+compatibility_date = "2026-11-11"
+
+[observability]
+enabled = true
