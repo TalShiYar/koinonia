@@ -1,0 +1,15 @@
+# N.U.V.E.M. — Worker + Durable Object (plano grátis: o Durable Object PRECISA ser SQLite → new_sqlite_classes)
+name = "nuvem"
+main = "nuvem_worker.js"
+compatibility_date = "2026-11-11"
+
+[[durable_objects.bindings]]
+name = "LAB"
+class_name = "Laboratorio"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Laboratorio"]
+
+[observability]
+enabled = true
